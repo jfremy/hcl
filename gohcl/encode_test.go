@@ -5,6 +5,7 @@ package gohcl_test
 
 import (
 	"fmt"
+	"testing"
 
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclwrite"
@@ -64,4 +65,33 @@ func ExampleEncodeIntoBody() {
 	// service "worker" {
 	//   executable = ["./worker"]
 	// }
+}
+
+func TestNonRegressionBlockMap(t *testing.T) {
+	type Child struct {
+		Name     string `hcl:"name,label"`
+		Property string `hcl:"prop,optional"`
+	}
+	type Base struct {
+		TestMap map[string]*Child      `hcl:"testMap,block"`
+		Env     map[string]string      `hcl:"env,block"`
+		Config  map[string]interface{} `hcl:"config,block"`
+	}
+
+	base := Base{
+		TestMap: map[string]*Child{
+			"test": {Name: "test", Property: "property"},
+		},
+		Env: map[string]string{
+			"PATH": "/bin:/sbin",
+		},
+		Config: map[string]interface{}{
+			"cmd":   []string{"/bin/ls"},
+			"image": "busybox",
+		},
+	}
+
+	f := hclwrite.NewEmptyFile()
+	gohcl.EncodeIntoBody(&base, f.Body())
+	fmt.Printf("%s", f.Bytes())
 }

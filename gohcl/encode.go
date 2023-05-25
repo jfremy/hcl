@@ -75,6 +75,9 @@ func EncodeAsBlock(val interface{}, blockType string) *hclwrite.Block {
 	labels := make([]string, len(tags.Labels))
 	for i, lf := range tags.Labels {
 		lv := rv.Field(lf.FieldIndex)
+		if lv.Kind() == reflect.Ptr && !lv.IsNil() {
+			lv = lv.Elem()
+		}
 		// We just stringify whatever we find. It should always be a string
 		// but if not then we'll still do something reasonable.
 		labels[i] = fmt.Sprintf("%s", lv.Interface())
@@ -82,6 +85,37 @@ func EncodeAsBlock(val interface{}, blockType string) *hclwrite.Block {
 
 	block := hclwrite.NewBlock(blockType, labels)
 	populateBody(rv, ty, tags, block.Body())
+	return block
+}
+
+func EncodeMapAsBlock(mapVal interface{}, blockType string) *hclwrite.Block {
+	rv := reflect.ValueOf(mapVal)
+	ty := rv.Type()
+	if ty.Kind() != reflect.Map {
+		panic(fmt.Sprintf("value is %s, not map", ty.Kind()))
+	}
+
+	block := hclwrite.NewBlock(blockType, nil)
+	iter := rv.MapRange()
+	for iter.Next() {
+		name := fmt.Sprintf("%s", iter.Key())
+		val := iter.Value()
+
+		valTy, err := gocty.ImpliedType(val.Interface())
+		if err != nil {
+			panic(fmt.Sprintf("cannot encode %T as HCL expression: %s", val.Interface(), err))
+		}
+
+		v, err := gocty.ToCtyValue(val.Interface(), valTy)
+		if err != nil {
+			// This should never happen, since we should always be able
+			// to decode into the implied type.
+			panic(fmt.Sprintf("failed to encode %T as %#v: %s", val.Interface(), valTy, err))
+		}
+
+		block.Body().SetAttributeValue(name, v)
+	}
+
 	return block
 }
 
@@ -148,9 +182,29 @@ func populateBody(rv reflect.Value, ty reflect.Type, tags *fieldTags, dst *hclwr
 		} else { // must be a block, then
 			elemTy := fieldTy
 			isSeq := false
+			isMap := false
+			isMapStruct := false
 			if elemTy.Kind() == reflect.Slice || elemTy.Kind() == reflect.Array {
 				isSeq = true
 				elemTy = elemTy.Elem()
+			}
+			if elemTy.Kind() == reflect.Map {
+				// Two cases to take into account:
+				// map["string"]interface{} where interface{} is not a Struct
+				// -> create an "anonymous" block mapping the key/val of the map to the block
+				//    This pattern is used for the meta property, config property of the docker drive, env var...
+				// map["string"]Struct|*Struct (assumed to have annotations)
+				// -> assume the map structure is there for coding ease - each key maps to a block (but will get its name
+				//    from the label annotated property in the inner struct).
+				//    This pattern is used in api.Job with the volumes property
+				isMap = true
+				childTy := elemTy.Elem()
+
+				if childTy.Kind() == reflect.Struct ||
+					(childTy.Kind() == reflect.Ptr && childTy.Elem().Kind() == reflect.Struct) {
+					isMapStruct = true
+					elemTy = childTy
+				}
 			}
 
 			if bodyType.AssignableTo(elemTy) || attrsType.AssignableTo(elemTy) {
@@ -169,6 +223,36 @@ func populateBody(rv reflect.Value, ty reflect.Type, tags *fieldTags, dst *hclwr
 						continue // ignore
 					}
 					block := EncodeAsBlock(elemVal.Interface(), name)
+					if !prevWasBlock {
+						dst.AppendNewline()
+						prevWasBlock = true
+					}
+					dst.AppendBlock(block)
+				}
+			} else if isMap {
+				if isMapStruct {
+					iter := fieldVal.MapRange()
+					for iter.Next() {
+						// We ignore the key of the map because EncodeAsBlock fetches the name of the block
+						// from the actual object (property with the label annotation).
+						// This could lead to inconsistent serialization if there is a mismatch between the
+						// two values (key and property with label annotation or not property with label annotation)
+						elemVal := iter.Value()
+						if !elemVal.IsValid() {
+							continue // ignore (elem value is nil pointer)
+						}
+						if elemTy.Kind() == reflect.Ptr && elemVal.IsNil() {
+							continue // ignore
+						}
+						block := EncodeAsBlock(elemVal.Interface(), name)
+						if !prevWasBlock {
+							dst.AppendNewline()
+							prevWasBlock = true
+						}
+						dst.AppendBlock(block)
+					}
+				} else {
+					block := EncodeMapAsBlock(fieldVal.Interface(), name)
 					if !prevWasBlock {
 						dst.AppendNewline()
 						prevWasBlock = true
